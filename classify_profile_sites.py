@@ -32,6 +32,18 @@ KEYWORDS = [
     ("Register", "register"),
     ("Sign Up", "sign up"),
 ]
+ADMIN_HINTS = [
+    "admin login",
+    "administrator login",
+    "site admin",
+    "admin panel",
+    "wp-admin",
+    "wordpress login",
+    "dashboard login",
+    "control panel",
+    "cpanel",
+    "backend login",
+]
 AUTH_PATHS = {
     "Login": ["/login", "/signin", "/sign-in"],
     "Sign In": ["/signin", "/sign-in", "/login"],
@@ -176,6 +188,37 @@ def detect_keywords_from_text(visible_text: str, final_url: str | None) -> list[
     return matches
 
 
+def looks_like_admin_login(result: FetchResult) -> bool:
+    haystack = f"{result.visible_text} {result.html} {result.final_url or ''}".lower()
+    if any(hint in haystack for hint in ADMIN_HINTS):
+        return True
+
+    final_path = urlparse(result.final_url or "").path.lower()
+    admin_paths = [
+        "/wp-admin",
+        "/wp-login",
+        "/admin",
+        "/administrator",
+        "/backend",
+        "/controlpanel",
+        "/cpanel",
+    ]
+    return any(path in final_path for path in admin_paths)
+
+
+def get_registered_domain(value: str | None) -> str:
+    if not value:
+        return ""
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    host = (parsed.netloc or parsed.path).lower()
+    if host.startswith("www."):
+        host = host[4:]
+    parts = [part for part in host.split(".") if part]
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return host
+
+
 def base_site_urls(value: str) -> list[str]:
     candidates = normalize_url(value)
     base_urls: list[str] = []
@@ -241,6 +284,70 @@ def should_retry_with_selenium(result: FetchResult, js_mode: str) -> bool:
     if js_mode != "off" and len(result.visible_text.strip()) < 80:
         return True
     return False
+
+
+def looks_expired_or_parked(result: FetchResult) -> bool:
+    haystack = f"{result.visible_text} {result.html}".lower()
+    markers = [
+        "domain for sale",
+        "buy this domain",
+        "this domain is for sale",
+        "parked free",
+        "expired domain",
+        "renew this domain",
+        "domain parked",
+        "sedo domain parking",
+        "hugedomains",
+        "bodis parking",
+    ]
+    return any(marker in haystack for marker in markers)
+
+
+def classify_registration_status(
+    source_value: str,
+    result: FetchResult,
+    matches: list[str],
+) -> str:
+    source_domain = get_registered_domain(source_value)
+    final_domain = get_registered_domain(result.final_url)
+
+    if result.final_url and source_domain and final_domain and source_domain != final_domain:
+        return f"Redirects to {final_domain}"
+
+    status_lower = result.status.lower()
+    if any(
+        marker in status_lower
+        for marker in [
+            "getaddrinfo failed",
+            "no connection could be made",
+            "name or service not known",
+            "timed out",
+        ]
+    ):
+        return "Domain unreachable"
+
+    if looks_expired_or_parked(result):
+        return "Domain expired/parked"
+
+    if looks_like_admin_login(result):
+        return "Admin login only, ignored"
+
+    if "Register" in matches or "Sign Up" in matches:
+        return "User registration available"
+
+    if "Login" in matches or "Sign In" in matches:
+        return "Login found, registration not confirmed"
+
+    if result.status == "HTTP 404":
+        return "Page not found"
+
+    if result.status == "HTTP 403":
+        return "Blocked or restricted"
+
+    if result.status != "OK":
+        return f"No registration confirmed | {result.status}"
+
+    return "No registration found"
 
 
 def detect_keywords(
@@ -454,6 +561,23 @@ def main() -> None:
         default=0,
         help="Process only the last N incomplete rows.",
     )
+    parser.add_argument(
+        "--row-start",
+        type=int,
+        default=0,
+        help="Process rows starting from this 1-based row number.",
+    )
+    parser.add_argument(
+        "--row-end",
+        type=int,
+        default=0,
+        help="Process rows ending at this 1-based row number.",
+    )
+    parser.add_argument(
+        "--force-row-range",
+        action="store_true",
+        help="When used with --row-start/--row-end, reprocess rows even if columns B and C are already filled.",
+    )
     args = parser.parse_args()
 
     if args.menu:
@@ -479,6 +603,11 @@ def main() -> None:
     else:
         print("Starting from row 1")
 
+    row_start = args.row_start if args.row_start > 0 else 1
+    row_end = args.row_end if args.row_end > 0 else ws.max_row
+    if row_start > row_end:
+        raise ValueError("--row-start cannot be greater than --row-end")
+
     rows_to_process = []
     for row in range(1, ws.max_row + 1):
         domain = ws.cell(row=row, column=1).value
@@ -487,9 +616,20 @@ def main() -> None:
 
         existing_status = ws.cell(row=row, column=2).value
         existing_type = ws.cell(row=row, column=3).value
+        if args.force_row_range and (args.row_start or args.row_end):
+            if row_start <= row <= row_end:
+                rows_to_process.append(row)
+            continue
         if existing_status and existing_type:
             continue
         rows_to_process.append(row)
+
+    if args.row_start or args.row_end:
+        rows_to_process = [row for row in rows_to_process if row_start <= row <= row_end]
+        if args.force_row_range:
+            print(f"Force processing row range {row_start} to {row_end}: {rows_to_process}")
+        else:
+            print(f"Processing row range {row_start} to {row_end}: {rows_to_process}")
 
     if args.sample_size > 0:
         sample_count = min(args.sample_size, len(rows_to_process))
@@ -526,12 +666,18 @@ def main() -> None:
                 js_mode=args.js_mode,
                 fetcher=selenium_fetcher if retried_with_selenium and selenium_fetcher is not None else fetcher,
             )
+            match_labels = [part.strip() for part in status_text.split(",") if part.strip() and part.strip() != "Not found"]
+            registration_status = classify_registration_status(str(domain), result, match_labels)
+            details: list[str] = [registration_status]
+            if match_labels:
+                details.append(f"Signals: {', '.join(match_labels)}")
             if result.status != "OK":
-                status_text = f"{status_text} | {result.status}"
+                details.append(result.status)
             if note_text:
-                status_text = f"{status_text} | {note_text}"
+                details.append(note_text)
             if retried_with_selenium:
-                status_text = f"{status_text} | fetched with Selenium"
+                details.append("fetched with Selenium")
+            status_text = " | ".join(details)
 
             site_type = classify_site(result.final_url or str(domain), result.visible_text or strip_html(result.html))
 
