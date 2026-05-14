@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import random
 import re
 import socket
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from html import unescape
@@ -12,6 +15,24 @@ from typing import Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener
+
+
+REQUIRED_PACKAGES = {
+    "openpyxl": "openpyxl",
+    "selenium": "selenium",
+}
+
+
+def ensure_dependencies() -> None:
+    missing = [package for module_name, package in REQUIRED_PACKAGES.items() if importlib.util.find_spec(module_name) is None]
+    if not missing:
+        return
+
+    print(f"Installing missing dependencies: {', '.join(missing)}")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+
+
+ensure_dependencies()
 
 import openpyxl
 from selenium import webdriver
